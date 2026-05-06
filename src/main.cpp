@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFiManager.h>
@@ -30,6 +31,7 @@ extern "C" {
 // =========================================================
 SemaphoreHandle_t prefsMutex   = nullptr;
 SemaphoreHandle_t sensorMutex  = nullptr;
+SemaphoreHandle_t fsMutex      = nullptr;  // guards LittleFS history writes
 volatile bool otaRestartPending = false;   // set true after successful HTTP OTA
 #define PREFS_LOCK()    xSemaphoreTake(prefsMutex,  portMAX_DELAY)
 #define PREFS_UNLOCK()  xSemaphoreGive(prefsMutex)
@@ -190,6 +192,110 @@ void saveDailyCap(int ch1based, uint16_t cap) {
     PREFS_LOCK();
     prefs.begin("peristaltica", false);
     prefs.putUShort(CAP_KEY[ch1based - 1], cap);
+    prefs.end();
+    PREFS_UNLOCK();
+}
+
+
+// =========================================================
+// IRRIGATION HISTORY  (LittleFS CSV — last 100 events)
+// =========================================================
+#define HIST_FILE "/hist.csv"
+#define HIST_MAX  100
+
+struct HistEvent {
+    uint32_t ts;       // unix timestamp
+    uint8_t  ch;       // 1-3
+    float    vol;      // mL
+    char     trig[8];  // "manual","sched","mqtt"
+};
+static HistEvent histBuf[HIST_MAX];
+static int histCount = 0;
+static int histHead  = 0;   // next write slot (circular)
+
+#define FS_LOCK()   xSemaphoreTake(fsMutex, portMAX_DELAY)
+#define FS_UNLOCK() xSemaphoreGive(fsMutex)
+
+// Write current buffer to file — caller must hold fsMutex.
+static void saveHistory() {
+    File f = LittleFS.open(HIST_FILE, "w");
+    if (!f) return;
+    int n = min(histCount, HIST_MAX);
+    for (int i = 0; i < n; i++) {
+        int idx = ((histHead - n + i) % HIST_MAX + HIST_MAX) % HIST_MAX;
+        f.printf("%u,%d,%.1f,%s\n",
+                 histBuf[idx].ts, (int)histBuf[idx].ch,
+                 histBuf[idx].vol, histBuf[idx].trig);
+    }
+    f.close();
+}
+
+void loadHistory() {
+    File f = LittleFS.open(HIST_FILE, "r");
+    if (!f) { Serial.println("History: no file yet"); return; }
+    histCount = 0; histHead = 0;
+    char line[48];
+    while (f.available() && histCount < HIST_MAX) {
+        int len = f.readBytesUntil('\n', line, 47);
+        line[len] = 0;
+        if (len < 5) continue;
+        HistEvent e = {};
+        unsigned long ts; int ch; float vol; char trig[8] = "?";
+        if (sscanf(line, "%lu,%d,%f,%7s", &ts, &ch, &vol, trig) >= 3) {
+            e.ts = (uint32_t)ts; e.ch = (uint8_t)ch; e.vol = vol;
+            strlcpy(e.trig, trig, 8);
+            histBuf[histHead] = e;
+            histHead = (histHead + 1) % HIST_MAX;
+            histCount++;
+        }
+    }
+    f.close();
+    Serial.printf("History: loaded %d events\n", histCount);
+}
+
+void logHistoryEvent(int ch1based, float vol, const char* trig) {
+    if (!trig || strcmp(trig, "cal") == 0 || vol < 0.01f) return;
+    if (!fsMutex) return;
+    FS_LOCK();
+    histBuf[histHead].ts  = (uint32_t)time(nullptr);
+    histBuf[histHead].ch  = (uint8_t)ch1based;
+    histBuf[histHead].vol = vol;
+    strlcpy(histBuf[histHead].trig, trig, 8);
+    histHead = (histHead + 1) % HIST_MAX;
+    if (histCount < HIST_MAX) histCount++;
+    saveHistory();
+    FS_UNLOCK();
+}
+
+void clearHistory() {
+    if (!fsMutex) return;
+    FS_LOCK();
+    histCount = 0; histHead = 0;
+    LittleFS.remove(HIST_FILE);
+    FS_UNLOCK();
+}
+
+
+// =========================================================
+// VACATION MODE
+// =========================================================
+bool   vacationMode  = false;
+time_t vacationUntil = 0;   // 0 = indefinite; >0 = auto-resume timestamp
+
+void loadVacationMode() {
+    PREFS_LOCK();
+    prefs.begin("peristaltica", true);
+    vacationMode  = prefs.getBool("vacMode",  false);
+    vacationUntil = (time_t)prefs.getUInt("vacUntil", 0);
+    prefs.end();
+    PREFS_UNLOCK();
+}
+
+void saveVacationMode() {
+    PREFS_LOCK();
+    prefs.begin("peristaltica", false);
+    prefs.putBool("vacMode",  vacationMode);
+    prefs.putUInt("vacUntil", (uint32_t)vacationUntil);
     prefs.end();
     PREFS_UNLOCK();
 }
@@ -528,8 +634,8 @@ void setupNTP() {
 // =========================================================
 // DECLARATIONS NEEDED BELOW
 // =========================================================
-void doRunVolume(int ch1based, float vol, float spd, const char* dir);
-void doRunDuration(int ch1based, uint32_t durSec, float spd, const char* dir);
+void doRunVolume(int ch1based, float vol, float spd, const char* dir, const char* trig = "manual");
+void doRunDuration(int ch1based, uint32_t durSec, float spd, const char* dir, const char* trig = "manual");
 void doStop(int ch1based);
 void publishHaDiscovery();
 void publishChannelState(int ch1based);
@@ -547,6 +653,14 @@ void checkSchedules() {
     lastCheckedMinute = t.tm_min;
 
     if (!firstTickConsumed) { firstTickConsumed = true; return; }
+
+    // Auto-deactivate vacation mode when the resume date has passed
+    if (vacationMode && vacationUntil > 0 && time(nullptr) >= vacationUntil) {
+        vacationMode = false; vacationUntil = 0;
+        saveVacationMode();
+        Serial.println("Vacation mode auto-deactivated");
+    }
+    if (vacationMode) return;
 
     if (inQuietHours(t.tm_hour)) return;
 
@@ -579,7 +693,7 @@ void checkSchedules() {
         }
 
         doRunVolume(schedules[i].channel, schedules[i].volume,
-                    schedules[i].speed,   schedules[i].direction);
+                    schedules[i].speed,   schedules[i].direction, "sched");
     }
 }
 
@@ -662,6 +776,7 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
 .sys b{color:#333}
 .cal-step{font-size:.85rem;color:#444;line-height:1.4}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <header>
@@ -670,11 +785,25 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
     <span><span class="dot off" id="dW"></span><span id="lW">WiFi</span></span>
     <span><span class="dot off" id="dM"></span>MQTT</span>
     <span class="time-badge" id="clock">--:--:--</span>
+    <span id="vacBadge" style="display:none;background:#ff8f00;border-radius:10px;padding:2px 8px;font-size:.75rem;font-weight:600">&#127958; Vacaciones</span>
   </div>
 </header>
 <main>
 
   <div id="channels" class="full" style="display:contents"></div>
+
+  <div class="card full">
+    <h2>&#128202; Historial de riegos</h2>
+    <div style="position:relative;max-height:220px"><canvas id="histChart"></canvas></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:14px 0 6px">
+      <span style="font-size:.86rem;font-weight:600;color:#1565c0">&#128336; &Uacute;ltimos riegos</span>
+      <button class="stp" style="padding:4px 14px;font-size:.78rem;flex:none" onclick="if(confirm('&#191;Borrar todo el historial?'))clearHist()">&#128465; Borrar historial</button>
+    </div>
+    <table>
+      <thead><tr><th>Fecha / Hora</th><th>Canal</th><th>Volumen</th><th>Origen</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="4" style="color:#aaa;text-align:center;padding:12px">Cargando...</td></tr></tbody>
+    </table>
+  </div>
 
   <div class="card full" style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
     <h2 style="border:none;padding:0;margin:0;flex:none">Control global</h2>
@@ -779,6 +908,7 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
     <div class="tabs">
       <div class="tab act" onclick="calTab('m')" id="tbM">Manual</div>
       <div class="tab" onclick="calTab('w')" id="tbW">Asistente</div>
+      <div class="tab" onclick="calTab('p')" id="tbP">B&aacute;scula</div>
     </div>
 
     <div id="calM">
@@ -796,6 +926,18 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
       <div class="row">
         <button class="sav" onclick="calCalc()">Calcular y guardar</button>
       </div>
+    </div>
+
+    <div id="calP" style="display:none">
+      <div class="cal-step">1) Pon un vaso en la b&aacute;scula y tara a 0.<br>2) Pulsa Bombear, espera que acabe.<br>3) Pesa el l&iacute;quido y escribe los gramos.</div>
+      <label>Segundos a bombear</label><input type="number" id="cpSec" value="30" min="5" max="120">
+      <div class="row"><button class="run" onclick="calStartPeso()">&#9654; Bombear</button></div>
+      <label>Gramos medidos en la b&aacute;scula</label>
+      <input type="number" id="cpGr" value="" step="0.1" min="0.1" placeholder="ej. 47.3">
+      <label>Densidad del l&iacute;quido (g/mL)</label>
+      <input type="number" id="cpDens" value="1.00" step="0.01" min="0.01">
+      <small style="color:#aaa;display:block;margin-bottom:4px">Agua = 1.00 &bull; Soluciones nutritivas &asymp; 1.01-1.05</small>
+      <div class="row"><button class="sav" onclick="calCalcPeso()">Calcular y guardar</button></div>
     </div>
 
     <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
@@ -823,6 +965,17 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
   <div class="card full">
     <h2>&#9881; Sistema</h2>
     <div class="sys" id="sysInfo">Cargando...</div>
+    <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;width:auto;font-size:.9rem;font-weight:500;margin-bottom:4px">
+      <input type="checkbox" id="vacMode" onchange="setVacation(this.checked)" style="width:auto;cursor:pointer">
+      &#127958; Modo vacaciones
+    </label>
+    <small style="color:#888;font-size:.75rem">Suspende todos los horarios autom&aacute;ticos mientras est&aacute;s fuera</small>
+    <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="width:auto;font-size:.76rem;color:#666;margin:0">Reanudar el:</label>
+      <input type="date" id="vacUntil" style="width:160px">
+      <small style="color:#aaa;font-size:.74rem">vac&iacute;o = indefinido</small>
+    </div>
     <div class="row" style="max-width:400px;margin-top:12px;gap:10px">
       <button class="sec" onclick="api('/api/system/reboot',{}).then(()=>alert('Reiniciando...'))">Reiniciar</button>
       <button class="sav" onclick="location.href='/update'">&#11014; Actualizar firmware</button>
@@ -837,6 +990,89 @@ let selDays = 0;
 let assigningMAC = '', assigningName = '';
 let sensors = [{},{},{}];
 let calMode = 'm';
+let histChart = null;
+
+// ---- History ----
+function loadHistory() {
+  api('/api/history').then(d => {
+    if (!d) return;
+    renderHistTable(d.events);
+    renderHistChart(computeChartData(d.events));
+  });
+}
+function computeChartData(events) {
+  const days=[], c1=[], c2=[], c3=[];
+  const DOW=['D','L','M','X','J','V','S'];
+  const now=new Date(); now.setHours(23,59,59,999);
+  for (let d=6; d>=0; d--) {
+    const day=new Date(now); day.setDate(day.getDate()-d);
+    days.push(DOW[day.getDay()]+' '+day.getDate()+'/'+(day.getMonth()+1));
+    const ds=new Date(day); ds.setHours(0,0,0,0);
+    const t0=ds.getTime()/1000, t1=t0+86400;
+    let v1=0, v2=0, v3=0;
+    (events||[]).forEach(e=>{
+      if(e.ts>=t0 && e.ts<t1){
+        if(e.ch===1) v1+=e.v; else if(e.ch===2) v2+=e.v; else v3+=e.v;
+      }
+    });
+    c1.push(+v1.toFixed(1)); c2.push(+v2.toFixed(1)); c3.push(+v3.toFixed(1));
+  }
+  return {days,c1,c2,c3};
+}
+function renderHistTable(events) {
+  const tb=$('histBody'); if(!tb) return;
+  if(!events||!events.length){
+    tb.innerHTML='<tr><td colspan="4" style="color:#aaa;text-align:center;padding:12px">Sin eventos registrados</td></tr>'; return;
+  }
+  const recent=[...events].reverse().slice(0,30);
+  const tL={manual:'Manual',sched:'Programado',mqtt:'MQTT'};
+  tb.innerHTML=recent.map(e=>{
+    const d=new Date(e.ts*1000);
+    const dt=d.toLocaleDateString('es',{day:'2-digit',month:'2-digit'})+' '+
+             d.toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
+    return `<tr><td>${dt}</td><td>Canal ${e.ch}</td><td>${e.v.toFixed(1)} mL</td><td>${tL[e.t]||e.t}</td></tr>`;
+  }).join('');
+}
+function renderHistChart(data) {
+  const canvas=$('histChart'); if(!canvas) return;
+  if(histChart){histChart.destroy(); histChart=null;}
+  if(typeof Chart==='undefined') return;
+  histChart=new Chart(canvas.getContext('2d'),{
+    type:'bar',
+    data:{labels:data.days, datasets:[
+      {label:'Canal 1', data:data.c1, backgroundColor:'rgba(21,101,192,0.75)'},
+      {label:'Canal 2', data:data.c2, backgroundColor:'rgba(46,125,50,0.75)'},
+      {label:'Canal 3', data:data.c3, backgroundColor:'rgba(230,81,0,0.75)'}
+    ]},
+    options:{responsive:true,
+      plugins:{legend:{position:'bottom'}},
+      scales:{y:{beginAtZero:true, title:{display:true, text:'mL'}}}}
+  });
+}
+function clearHist() {
+  api('/api/history', null, 'DELETE').then(()=>loadHistory());
+}
+
+// ---- Vacation mode ----
+function loadVacation() {
+  api('/api/vacation').then(d=>{
+    if(!d) return;
+    const cb=$('vacMode'); if(cb) cb.checked=d.enabled;
+    const vb=$('vacBadge'); if(vb) vb.style.display=d.enabled?'':'none';
+    if(d.until>0 && $('vacUntil')){
+      const dt=new Date(d.until*1000);
+      $('vacUntil').value=dt.toISOString().split('T')[0];
+    }
+  });
+}
+function setVacation(en) {
+  const dateStr=($('vacUntil')||{}).value||'';
+  let until=0;
+  if(dateStr){ const d=new Date(dateStr+'T23:59:59'); until=Math.floor(d.getTime()/1000); }
+  api('/api/vacation',{enabled:en,until}).then(d=>{
+    if(d?.ok){ const vb=$('vacBadge'); if(vb) vb.style.display=en?'':'none'; }
+  });
+}
 
 async function api(path, body, method) {
   try {
@@ -896,8 +1132,10 @@ function calTab(m) {
   calMode = m;
   $('tbM').className = 'tab' + (m==='m'?' act':'');
   $('tbW').className = 'tab' + (m==='w'?' act':'');
+  $('tbP').className = 'tab' + (m==='p'?' act':'');
   $('calM').style.display = m==='m'?'':'none';
   $('calW').style.display = m==='w'?'':'none';
+  $('calP').style.display = m==='p'?'':'none';
 }
 function calSave() {
   api('/api/calibrate', {channel:+$('cc').value, stepsperml:+$('cs').value})
@@ -920,6 +1158,25 @@ function calCalc() {
       if (d?.stepsperml) {
         $('cs').value = d.stepsperml;
         $('cm').textContent = `Calibrado: ${d.stepsperml} pasos/mL`;
+        setTimeout(()=>$('cm').textContent='',4000);
+      }
+    });
+}
+function calStartPeso() {
+  const ch=+$('cc').value, sec=+$('cpSec').value;
+  api('/api/calibrate/run',{channel:ch,duration:sec}).then(()=>{
+    $('cm').textContent=`Bombeando ${sec} s... coloca el vaso en la báscula y tara ahora.`;
+  });
+}
+function calCalcPeso() {
+  const gr=+$('cpGr').value, dens=+(($('cpDens').value)||1)||1;
+  const ml=gr/dens, sec=+$('cpSec').value, ch=+$('cc').value;
+  if(ml<=0||sec<=0){$('cm').textContent='Datos inválidos';return;}
+  api('/api/calibrate/compute',{channel:ch,ml,seconds:sec})
+    .then(d=>{
+      if(d?.stepsperml){
+        $('cs').value=d.stepsperml;
+        $('cm').textContent=`Calibrado: ${d.stepsperml} pasos/mL`;
         setTimeout(()=>$('cm').textContent='',4000);
       }
     });
@@ -1107,6 +1364,8 @@ function poll() {
     if(!d)return;
     $('dW').className='dot on'; $('lW').textContent=d.ip||'WiFi';
     $('dM').className='dot '+(d.mqtt?'on':'off');
+    const vb=$('vacBadge'); if(vb) vb.style.display=d.vacation?'':'none';
+    const vcb=$('vacMode'); if(vcb&&vcb!==document.activeElement) vcb.checked=!!d.vacation;
     for(let i=0;i<3;i++){
       const m=d.motors[i]||{};
       $('p'+(i+1)).style.width=(m.progress||0)+'%';
@@ -1124,6 +1383,8 @@ api('/api/config').then(d=>{if(!d)return;$('ms').value=d.server||'';$('mp').valu
 api('/api/timezone').then(d=>{if(d)$('tzIn').value=d.tz||'';});
 api('/api/ntp').then(d=>{if(d){$('ntp1').value=d.ntp1||'';$('ntp2').value=d.ntp2||'';}});
 api('/api/quiet').then(d=>{if(d){$('qS').value=d.start||0;$('qE').value=d.end||0;}});
+loadHistory();
+loadVacation();
 $('cc').addEventListener('change', () => {
   const ch = +$('cc').value;
   api('/api/cap?channel='+ch).then(d=>{if(d)$('capV').value=d.cap||0;});
@@ -1135,6 +1396,7 @@ loadSensors();
 setInterval(poll,1000);
 setInterval(pollSys,15000);
 setInterval(loadSensors,30000);
+setInterval(loadHistory,60000);
 poll();
 pollSys();
 </script>
@@ -1158,7 +1420,7 @@ static void applyRunCommon(int i, long stepsAbs, float speedStepsPerSec) {
     motors.run(i, absSteps, speedStepsPerSec, cw, onTargetReached);
 }
 
-void doRunVolume(int ch1based, float vol, float spd, const char* dir) {
+void doRunVolume(int ch1based, float vol, float spd, const char* dir, const char* trig) {
     if (ch1based < 1 || ch1based > NUM_CH) return;
     if (vol <= 0 || spd <= 0) return;
     int i = ch1based - 1;
@@ -1180,11 +1442,12 @@ void doRunVolume(int ch1based, float vol, float spd, const char* dir) {
 
     DurationMode[i] = false;
     DailyVolume[i] += vol;
+    logHistoryEvent(ch1based, vol, trig);
     applyRunCommon(i, steps, stepsPerSec);
     publishChannelState(ch1based);
 }
 
-void doRunDuration(int ch1based, uint32_t durSec, float spd, const char* dir) {
+void doRunDuration(int ch1based, uint32_t durSec, float spd, const char* dir, const char* trig) {
     if (ch1based < 1 || ch1based > NUM_CH) return;
     if (durSec == 0 || spd <= 0) return;
     int i = ch1based - 1;
@@ -1203,6 +1466,7 @@ void doRunDuration(int ch1based, uint32_t durSec, float spd, const char* dir) {
 
     DurationMode[i] = true;
     DailyVolume[i] += vol;
+    logHistoryEvent(ch1based, vol, trig);
     applyRunCommon(i, steps, stepsPerSec);
     publishChannelState(ch1based);
 }
@@ -1419,9 +1683,9 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties,
         const char* action = doc["action"] | "";
         if (!strcmp(action, "run")) {
             if (doc.containsKey("duration"))
-                doRunDuration(chFromTopic, doc["duration"]|0, doc["speed"]|10.0f, doc["direction"]|"cw");
+                doRunDuration(chFromTopic, doc["duration"]|0, doc["speed"]|10.0f, doc["direction"]|"cw", "mqtt");
             else
-                doRunVolume(chFromTopic, doc["volume"]|0.0f, doc["speed"]|10.0f, doc["direction"]|"cw");
+                doRunVolume(chFromTopic, doc["volume"]|0.0f, doc["speed"]|10.0f, doc["direction"]|"cw", "mqtt");
         } else if (!strcmp(action, "stop")) {
             doStop(chFromTopic);
         }
@@ -1431,8 +1695,8 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties,
     const char* action = doc["action"] | "";
     int ch = doc["channel"] | 0;
     if (!strcmp(action, "run")) {
-        if (doc.containsKey("duration")) doRunDuration(ch, doc["duration"]|0, doc["speed"]|10.0f, doc["direction"]|"cw");
-        else doRunVolume(ch, doc["volume"]|0.0f, doc["speed"]|10.0f, doc["direction"]|"cw");
+        if (doc.containsKey("duration")) doRunDuration(ch, doc["duration"]|0, doc["speed"]|10.0f, doc["direction"]|"cw", "mqtt");
+        else doRunVolume(ch, doc["volume"]|0.0f, doc["speed"]|10.0f, doc["direction"]|"cw", "mqtt");
     }
     else if (!strcmp(action, "stop"))      doStop(ch);
     else if (!strcmp(action, "calibrate")) saveCalibration(ch, doc["stepsperml"]|1600L);
@@ -1510,9 +1774,10 @@ void setupWebServer() {
 
     webServer.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req){
         StaticJsonDocument<512> doc;
-        doc["ip"]   = WiFi.localIP().toString();
-        doc["mqtt"] = mqttClient.connected();
-        doc["time"] = currentTimeStr();
+        doc["ip"]       = WiFi.localIP().toString();
+        doc["mqtt"]     = mqttClient.connected();
+        doc["time"]     = currentTimeStr();
+        doc["vacation"] = vacationMode;
         JsonArray m  = doc.createNestedArray("motors");
         JsonArray dy = doc.createNestedArray("daily");
         JsonArray cp = doc.createNestedArray("caps");
@@ -1707,7 +1972,7 @@ void setupWebServer() {
             calRun.active = true; calRun.channel = ch;
             calRun.startPos = 0;
             float spd = 10.0f;
-            doRunDuration(ch, durSec, spd, "cw");
+            doRunDuration(ch, durSec, spd, "cw", "cal");  // "cal" suppresses history logging
             calRun.steps = (uint32_t)StepsToMove[i];
             req->send(200, "application/json", "{\"ok\":true}");
         }
@@ -1830,6 +2095,14 @@ void setupWebServer() {
             saveQuietHours(s, e);
             req->send(200, "application/json", "{\"ok\":true}");
         }
+        else if (path == "/api/vacation") {
+            bool en    = doc["enabled"] | false;
+            uint32_t u = doc["until"]   | 0;
+            vacationMode  = en;
+            vacationUntil = (time_t)u;
+            saveVacationMode();
+            req->send(200, "application/json", "{\"ok\":true}");
+        }
         else if (path == "/api/resetwifi") {
             req->send(200, "application/json", "{\"ok\":true}");
             delay(500);
@@ -1842,11 +2115,42 @@ void setupWebServer() {
     const char* posts[] = {
         "/api/run", "/api/stop", "/api/calibrate", "/api/calibrate/run", "/api/calibrate/compute",
         "/api/cap", "/api/config", "/api/schedules", "/api/sensors", "/api/sensors/read",
-        "/api/ble/scan", "/api/timezone", "/api/ntp", "/api/quiet", "/api/resetwifi"
+        "/api/ble/scan", "/api/timezone", "/api/ntp", "/api/quiet", "/api/resetwifi",
+        "/api/vacation"
     };
     for (auto p : posts) {
         webServer.on(p, HTTP_POST, [](AsyncWebServerRequest*){}, NULL, bodyHandler);
     }
+
+    // ---- Irrigation history ----
+    webServer.on("/api/history", HTTP_GET, [](AsyncWebServerRequest* req){
+        String json = "{\"events\":[";
+        int n = min(histCount, HIST_MAX);
+        for (int i = 0; i < n; i++) {
+            int idx = ((histHead - n + i) % HIST_MAX + HIST_MAX) % HIST_MAX;
+            if (i) json += ',';
+            json += "{\"ts\":";  json += histBuf[idx].ts;
+            json += ",\"ch\":";  json += (int)histBuf[idx].ch;
+            json += ",\"v\":";   json += String(histBuf[idx].vol, 1);
+            json += ",\"t\":\""; json += histBuf[idx].trig; json += "\"}";
+        }
+        json += "]}";
+        req->send(200, "application/json", json);
+    });
+
+    webServer.on("/api/history", HTTP_DELETE, [](AsyncWebServerRequest* req){
+        clearHistory();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    // ---- Vacation mode ----
+    webServer.on("/api/vacation", HTTP_GET, [](AsyncWebServerRequest* req){
+        String json = "{\"enabled\":";
+        json += vacationMode ? "true" : "false";
+        json += ",\"until\":"; json += (uint32_t)vacationUntil;
+        json += "}";
+        req->send(200, "application/json", json);
+    });
 
     // ---- OTA via browser (/update) ----
     webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -2004,6 +2308,7 @@ void setup() {
 
     prefsMutex  = xSemaphoreCreateMutex();
     sensorMutex = xSemaphoreCreateMutex();
+    fsMutex     = xSemaphoreCreateMutex();
 
     xTaskCreatePinnedToCore(core0assignments, "Core_0", 10000, NULL, 1, &C0, 0);
 
@@ -2012,10 +2317,13 @@ void setup() {
 
     WiFi.onEvent(WiFiEvent);
 
+    if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
     loadMqttConfig();
     loadCalibration();
     loadSchedules();
     loadSensorConfigs();
+    loadVacationMode();
+    loadHistory();
 
     String mac = WiFi.macAddress(); mac.replace(":", "");
     haDeviceId = "peristaltica-" + mac.substring(6);
