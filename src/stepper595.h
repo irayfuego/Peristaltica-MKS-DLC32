@@ -3,25 +3,32 @@
 //
 // The DLC32 v2.1 board does NOT wire ESP32 GPIOs directly to the
 // stepper drivers. STEP/DIR/EN lines are driven through a 74HC595
-// shift register over hardware SPI:
+// shift register over hardware SPI on these pins (matching the
+// official MKS firmware and FluidNC config):
 //
-//   SCK   = GPIO26  (74HC595 SHCP / BCK)
-//   MOSI  = GPIO27  (74HC595 DS    / DATA)
-//   SS    = GPIO25  (74HC595 STCP  / LATCH / WS)
+//   SCK   = GPIO16  (74HC595 SHCP / I2S BCK)
+//   MOSI  = GPIO21  (74HC595 DS   / I2S DATA)
+//   SS    = GPIO17  (74HC595 STCP / I2S WS / LATCH)
 //
-// 74HC595 bit layout (matches FluidNC's MKS DLC32 v2.1 config):
-//   Q0 = motor 0 STEP
-//   Q1 = motor 0 DIR
-//   Q2 = motor 1 STEP
-//   Q3 = motor 1 DIR
-//   Q4 = motor 2 STEP
-//   Q5 = motor 2 DIR
-//   Q6 = global ENABLE (active LOW; bit=0 enables drivers)
+// 74HC595 bit layout (verified against MKS-DLC32-FIRMWARE
+// `i2s_out_xyz_mks_dlc32.h` and FluidNC's I2SO bit numbering):
+//
+//   Q0 = global DISABLE (shared, ACTIVE HIGH → drivers off)
+//   Q1 = X (ch1) STEP            Q2 = X (ch1) DIR
+//   Q3 = Z (ch3) STEP            Q4 = Z (ch3) DIR
+//   Q5 = Y (ch2) STEP            Q6 = Y (ch2) DIR
 //   Q7 = unused
 //
-// One FreeRTOS task per channel. Each runs the configured number
-// of steps at the configured rate, then fires an optional callback.
-// All shift-register writes are guarded by a mutex.
+// Channel→axis mapping (so plug pump 1 in X, pump 2 in Y, pump 3 in Z):
+//   ch index 0 → X driver socket
+//   ch index 1 → Y driver socket
+//   ch index 2 → Z driver socket
+//
+// One FreeRTOS task per channel runs the configured number of steps
+// at the configured rate, then fires an optional completion callback.
+// Every shift-register update (bit change + SPI write) is performed
+// atomically under a mutex to prevent torn read-modify-write between
+// concurrently running channels.
 // =====================================================================
 #pragma once
 
@@ -45,75 +52,96 @@ public:
     inline void run(int ch, long steps, float stepsPerSec, bool cw, Callback onComplete = nullptr);
     inline void stop(int ch);
     inline void stopAll();
-    inline bool isRunning(int ch) const { return ch >= 0 && ch < STEPPER595_NUM_CH && _ctx[ch].running; }
+
+    inline bool isRunning(int ch) const {
+        return ch >= 0 && ch < STEPPER595_NUM_CH && _ctx[ch].running;
+    }
     inline bool anyRunning() const {
         for (int i = 0; i < STEPPER595_NUM_CH; i++) if (_ctx[i].running) return true;
         return false;
     }
-    inline long stepsRemaining(int ch) const { return (ch>=0&&ch<STEPPER595_NUM_CH)? _ctx[ch].remaining : 0; }
-    inline long stepsTotal(int ch)     const { return (ch>=0&&ch<STEPPER595_NUM_CH)? _ctx[ch].total     : 0; }
+    inline long stepsRemaining(int ch) const {
+        return (ch >= 0 && ch < STEPPER595_NUM_CH) ? _ctx[ch].remaining : 0;
+    }
+    inline long stepsTotal(int ch) const {
+        return (ch >= 0 && ch < STEPPER595_NUM_CH) ? _ctx[ch].total : 0;
+    }
 
-    inline void enableMotors()  { _enable = true;  pushBits(); }
-    inline void disableMotors() { _enable = false; pushBits(); }
+    inline void enableMotors();
+    inline void disableMotors();
 
 private:
+    // ---- 74HC595 bit map (Qn → bit position in transmitted byte) ----
+    static constexpr uint8_t BIT_DISABLE = 0;          // Q0 active HIGH
+    // chIdx 0=X (pump1), 1=Y (pump2), 2=Z (pump3)
+    static constexpr uint8_t stepBitFor(int ch) {
+        // X=Q1, Y=Q5, Z=Q3 (matches MKS firmware I2SO bit assignments)
+        return (ch == 0) ? 1 : (ch == 1) ? 5 : 3;
+    }
+    static constexpr uint8_t dirBitFor(int ch) {
+        // X=Q2, Y=Q6, Z=Q4
+        return (ch == 0) ? 2 : (ch == 1) ? 6 : 4;
+    }
+    // Q7 unused.
+
+    // ---- SPI pin assignments (DLC32 v2.1) ----
+    static constexpr int PIN_SCK   = 16;
+    static constexpr int PIN_MOSI  = 21;
+    static constexpr int PIN_LATCH = 17;
+
+    static constexpr uint32_t SPI_HZ = 4000000;
+
     struct Ctx {
-        TaskHandle_t   task;
-        volatile bool  running;
-        volatile bool  abort;
-        volatile long  total;
-        volatile long  remaining;
-        volatile uint32_t halfPeriodUs;  // half of step period
-        volatile bool  dirCw;
-        Callback       onComplete;
+        TaskHandle_t      task          = nullptr;
+        volatile bool     running       = false;
+        volatile bool     abort         = false;
+        volatile long     total         = 0;
+        volatile long     remaining     = 0;
+        volatile uint32_t halfPeriodUs  = 500;
+        volatile bool     dirCw         = true;
+        Callback          onComplete    = nullptr;
     };
 
-    Ctx _ctx[STEPPER595_NUM_CH] = {};
-    volatile uint8_t _bits = 0;       // current 74HC595 byte
-    bool _enable = false;             // logical enable (true=drivers on)
-    SPIClass* _spi = nullptr;
-    SemaphoreHandle_t _spiMutex = nullptr;
+    Ctx               _ctx[STEPPER595_NUM_CH];
+    uint8_t           _bits      = 0;          // step/dir live bits (Q1..Q6 ; Q0/Q7 forced)
+    bool              _enable    = false;      // logical enable (true=drivers on)
+    SPIClass*         _spi       = nullptr;
+    SemaphoreHandle_t _spiMutex  = nullptr;
 
-    static constexpr int PIN_SCK   = 26;
-    static constexpr int PIN_MOSI  = 27;
-    static constexpr int PIN_LATCH = 25;
+    struct TaskArg { Stepper595* self; int ch; };
+    TaskArg _taskArg[STEPPER595_NUM_CH];
 
-    inline void pushBits() {
-        // Compose byte. Q6 = enable (active LOW => bit=0 when enabled).
-        uint8_t b = _bits & 0x3F;
-        if (!_enable) b |= (1 << 6);   // disable: drive EN high
-        // Q7 unused, leave 0.
-        if (xSemaphoreTake(_spiMutex, portMAX_DELAY) == pdTRUE) {
-            _spi->beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-            digitalWrite(PIN_LATCH, LOW);
-            _spi->transfer(b);
-            digitalWrite(PIN_LATCH, HIGH);
-            _spi->endTransaction();
-            xSemaphoreGive(_spiMutex);
-        }
+    // Atomic: take mutex → modify shift-register state → SPI write → release.
+    // setMask = bits to OR-in, clearMask = bits to AND-out (in our internal byte).
+    // Q0 (DISABLE) and Q7 are *not* part of _bits; they are recomputed every push.
+    inline void writePort(uint8_t setMask, uint8_t clearMask) {
+        if (xSemaphoreTake(_spiMutex, portMAX_DELAY) != pdTRUE) return;
+        _bits = (_bits & ~clearMask) | setMask;
+        uint8_t b = _bits & 0x7E;            // keep only Q1..Q6
+        if (!_enable) b |= (1 << BIT_DISABLE); // Q0 HIGH ⇒ drivers disabled
+        _spi->beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
+        digitalWrite(PIN_LATCH, LOW);
+        _spi->transfer(b);
+        digitalWrite(PIN_LATCH, HIGH);
+        _spi->endTransaction();
+        xSemaphoreGive(_spiMutex);
     }
 
-    inline void setStepBit(int ch, bool high) {
-        uint8_t mask = 1 << (ch * 2);
-        if (high) _bits |=  mask;
-        else      _bits &= ~mask;
-    }
-    inline void setDirBit(int ch, bool cw) {
-        uint8_t mask = 1 << (ch * 2 + 1);
-        if (cw) _bits |=  mask;
-        else    _bits &= ~mask;
+    inline void pushState() { writePort(0, 0); }   // re-emit current bits (e.g. after enable toggle)
+
+    inline void stepHigh(int ch)   { writePort(uint8_t(1 << stepBitFor(ch)), 0); }
+    inline void stepLow (int ch)   { writePort(0, uint8_t(1 << stepBitFor(ch))); }
+    inline void setDir  (int ch, bool cw) {
+        uint8_t m = 1 << dirBitFor(ch);
+        if (cw) writePort(m, 0);
+        else    writePort(0, m);
     }
 
     static void taskTrampoline(void* arg) {
-        struct Pack { Stepper595* self; int ch; };
-        Pack* p = (Pack*) arg;
-        Stepper595* self = p->self;
-        int ch = p->ch;
-        // free pack — note: we never delete because we never stop the task
+        TaskArg* a = (TaskArg*) arg;
         for (;;) {
-            // Wait for a notification = a new run request
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            self->doRun(ch);
+            a->self->doRun(a->ch);
         }
     }
 
@@ -122,30 +150,28 @@ private:
         c.running = true;
         c.abort   = false;
 
-        // Set DIR before running
-        setDirBit(ch, c.dirCw);
-        pushBits();
+        // 1. Latch DIR + enable drivers (the very first call may need to flip Q0)
+        setDir(ch, c.dirCw);
+        if (!_enable) { _enable = true; pushState(); }
+        // DIR setup time: stepper drivers want at most ~50 ns; 5 µs is plenty
         delayMicroseconds(5);
 
-        // Enable drivers if not already
-        if (!_enable) { _enable = true; pushBits(); delayMicroseconds(20); }
-
         const uint32_t halfUs = c.halfPeriodUs;
+        const uint32_t pulseHigh = 5;                                  // µs STEP HIGH
+        const uint32_t fullPeriodUs = halfUs * 2u;
+        const uint32_t lowUs = (fullPeriodUs > pulseHigh) ? (fullPeriodUs - pulseHigh) : 1;
 
         while (c.remaining > 0 && !c.abort) {
-            // STEP HIGH ~5us
-            setStepBit(ch, true);
-            pushBits();
-            delayMicroseconds(5);
-            setStepBit(ch, false);
-            pushBits();
+            stepHigh(ch);
+            delayMicroseconds(pulseHigh);
+            stepLow(ch);
 
-            // Remaining low time = (2*halfUs) - 5us pulse - latency
-            uint32_t lowUs = (halfUs * 2) > 5 ? (halfUs * 2 - 5) : 1;
-            if (lowUs >= 1500) {
-                // Long step interval: yield to other tasks
-                vTaskDelay(pdMS_TO_TICKS(lowUs / 1000));
-                uint32_t rem = lowUs % 1000;
+            // Sleep the rest of the period
+            if (lowUs >= 2000) {
+                // Long step interval — yield via vTaskDelay to free the core
+                uint32_t ms = lowUs / 1000;
+                vTaskDelay(pdMS_TO_TICKS(ms));
+                uint32_t rem = lowUs - ms * 1000;
                 if (rem) delayMicroseconds(rem);
             } else {
                 delayMicroseconds(lowUs);
@@ -153,17 +179,19 @@ private:
             c.remaining--;
         }
 
-        bool aborted = c.abort;
+        const bool aborted = c.abort;
         c.running = false;
 
-        // If no other channel is running, drop enable to save power
+        // If no other channel is still running, drop the global enable to save power/heat.
         bool any = false;
         for (int i = 0; i < STEPPER595_NUM_CH; i++) if (_ctx[i].running) { any = true; break; }
-        if (!any) { _enable = false; pushBits(); }
+        if (!any) { _enable = false; pushState(); }
 
         if (!aborted && c.onComplete) c.onComplete(ch + 1);
     }
 };
+
+// ========================= public API ============================
 
 inline void Stepper595::begin() {
     pinMode(PIN_LATCH, OUTPUT);
@@ -171,47 +199,47 @@ inline void Stepper595::begin() {
 
     _spiMutex = xSemaphoreCreateMutex();
 
-    // Use HSPI bus, remapped to DLC32 pins (SCK=26, MOSI=27, SS=25, MISO=-1)
+    // HSPI on remapped pins; MISO unused (-1).
     _spi = new SPIClass(HSPI);
     _spi->begin(PIN_SCK, -1, PIN_MOSI, PIN_LATCH);
+    // The Arduino SPIClass holds onto SS/CS itself; we still drive LATCH
+    // manually via digitalWrite so we get the precise rising edge after each
+    // transfer.
 
-    // Initial state: enable high (drivers off), step/dir all 0
-    _bits = 0;
+    _bits   = 0;
     _enable = false;
-    pushBits();
+    pushState();   // pushes 0x01 → drivers disabled, all step/dir LOW
 
     // Spawn one task per channel
-    static struct { Stepper595* self; int ch; } packs[STEPPER595_NUM_CH];
     for (int ch = 0; ch < STEPPER595_NUM_CH; ch++) {
-        _ctx[ch].running = false;
-        _ctx[ch].abort   = false;
-        _ctx[ch].total = _ctx[ch].remaining = 0;
-        _ctx[ch].onComplete = nullptr;
-        packs[ch].self = this;
-        packs[ch].ch   = ch;
+        _taskArg[ch] = { this, ch };
         char name[16]; snprintf(name, sizeof(name), "stp595_%d", ch);
-        xTaskCreatePinnedToCore(taskTrampoline, name, 3072, &packs[ch], 5, &_ctx[ch].task, 1);
+        xTaskCreatePinnedToCore(taskTrampoline, name, 3072, &_taskArg[ch], 5, &_ctx[ch].task, 1);
     }
 }
 
 inline void Stepper595::run(int ch, long steps, float stepsPerSec, bool cw, Callback onComplete) {
     if (ch < 0 || ch >= STEPPER595_NUM_CH) return;
-    if (steps <= 0 || stepsPerSec <= 0.0f) return;
+    if (steps <= 0 || stepsPerSec <= 0.0f)  return;
     Ctx& c = _ctx[ch];
+
+    // If a run is in flight on this channel, stop it first
     if (c.running) {
         c.abort = true;
-        // Wait briefly for prior run to acknowledge
         for (int i = 0; i < 50 && c.running; i++) vTaskDelay(pdMS_TO_TICKS(2));
     }
-    c.total       = steps;
-    c.remaining   = steps;
-    c.dirCw       = cw;
-    c.onComplete  = onComplete;
-    // half period in microseconds: 1e6 / (2 * sps)
+
+    c.total      = steps;
+    c.remaining  = steps;
+    c.dirCw      = cw;
+    c.onComplete = onComplete;
+
+    // Half-period in µs = 1e6 / (2 * stepsPerSec)
     float hp = 500000.0f / stepsPerSec;
-    if (hp < 5.0f) hp = 5.0f;            // clamp to safe min
-    if (hp > 500000.0f) hp = 500000.0f;  // 1Hz min
+    if (hp < 5.0f)        hp = 5.0f;          // upper bound on step rate
+    if (hp > 500000.0f)   hp = 500000.0f;     // 1 Hz min
     c.halfPeriodUs = (uint32_t) hp;
+
     c.abort = false;
     xTaskNotifyGive(c.task);
 }
@@ -224,3 +252,6 @@ inline void Stepper595::stop(int ch) {
 inline void Stepper595::stopAll() {
     for (int i = 0; i < STEPPER595_NUM_CH; i++) _ctx[i].abort = true;
 }
+
+inline void Stepper595::enableMotors()  { _enable = true;  pushState(); }
+inline void Stepper595::disableMotors() { _enable = false; pushState(); }
