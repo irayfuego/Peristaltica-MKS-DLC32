@@ -3,6 +3,7 @@
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <Update.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFiManager.h>
@@ -29,6 +30,7 @@ extern "C" {
 // =========================================================
 SemaphoreHandle_t prefsMutex   = nullptr;
 SemaphoreHandle_t sensorMutex  = nullptr;
+volatile bool otaRestartPending = false;   // set true after successful HTTP OTA
 #define PREFS_LOCK()    xSemaphoreTake(prefsMutex,  portMAX_DELAY)
 #define PREFS_UNLOCK()  xSemaphoreGive(prefsMutex)
 #define SENSOR_LOCK()   xSemaphoreTake(sensorMutex, portMAX_DELAY)
@@ -821,8 +823,9 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
   <div class="card full">
     <h2>&#9881; Sistema</h2>
     <div class="sys" id="sysInfo">Cargando...</div>
-    <div class="row" style="max-width:300px;margin-top:12px">
+    <div class="row" style="max-width:400px;margin-top:12px;gap:10px">
       <button class="sec" onclick="api('/api/system/reboot',{}).then(()=>alert('Reiniciando...'))">Reiniciar</button>
+      <button class="sav" onclick="location.href='/update'">&#11014; Actualizar firmware</button>
     </div>
   </div>
 
@@ -1845,6 +1848,149 @@ void setupWebServer() {
         webServer.on(p, HTTP_POST, [](AsyncWebServerRequest*){}, NULL, bodyHandler);
     }
 
+    // ---- OTA via browser (/update) ----
+    webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* req) {
+        req->send(200, "text/html", R"rawliteral(
+<!DOCTYPE html><html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTA – Perist&aacute;ltica</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f0f2f5;color:#333}
+header{background:#1565c0;color:#fff;padding:14px 20px}
+header h1{font-size:1.1rem;font-weight:600}
+main{max-width:520px;margin:24px auto;padding:0 14px}
+.card{background:#fff;border-radius:10px;padding:22px;box-shadow:0 1px 5px rgba(0,0,0,.1)}
+.card h2{font-size:.95rem;margin-bottom:14px;color:#1565c0;font-weight:600;
+         border-bottom:1px solid #e3e8f0;padding-bottom:8px}
+p{font-size:.86rem;color:#555;margin:8px 0;line-height:1.5}
+code{background:#f0f2f5;padding:2px 6px;border-radius:4px;font-size:.83rem}
+label{display:block;font-size:.78rem;color:#666;margin:14px 0 4px}
+input[type=file]{width:100%;padding:7px;border:1px dashed #90a4ae;
+                 border-radius:6px;font-size:.85rem;background:#fafafa;cursor:pointer}
+.row{margin-top:16px}
+button{width:100%;padding:10px;border:none;border-radius:6px;
+       font-size:.92rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+.run{background:#1565c0;color:#fff}.run:disabled{opacity:.5;cursor:not-allowed}
+#msg{margin-top:12px;font-size:.84rem;min-height:1.2em;font-weight:500}
+.ok{color:#2e7d32}.err{color:#c62828}
+.pb-wrap{display:none;margin-top:12px}
+.pb{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden}
+.pf{height:100%;background:#1565c0;border-radius:4px;width:0;transition:width .3s}
+</style>
+</head>
+<body>
+<header><h1>&#11014; Actualizaci&oacute;n OTA – Bomba Perist&aacute;ltica</h1></header>
+<main>
+<div class="card">
+  <h2>Subir nuevo firmware</h2>
+  <p>Selecciona el fichero <code>firmware.bin</code> generado por PlatformIO:<br>
+     <small style="color:#888">.pio/build/mks_dlc32_v2_1/firmware.bin</small></p>
+  <form id="frm" method="POST" action="/update" enctype="multipart/form-data">
+    <label>Fichero .bin</label>
+    <input type="file" name="firmware" id="file" accept=".bin" required>
+    <div class="row">
+      <button type="submit" class="run" id="btn">&#11014; Subir y actualizar</button>
+    </div>
+  </form>
+  <div class="pb-wrap" id="pbWrap"><div class="pb"><div class="pf" id="pf"></div></div></div>
+  <div id="msg"></div>
+  <p style="margin-top:18px;font-size:.78rem;color:#aaa">
+    &larr; <a href="/" style="color:#1565c0">Volver a la UI principal</a>
+  </p>
+</div>
+</main>
+<script>
+const frm = document.getElementById('frm');
+const btn = document.getElementById('btn');
+const msg = document.getElementById('msg');
+const pbWrap = document.getElementById('pbWrap');
+const pf = document.getElementById('pf');
+
+frm.onsubmit = async function(e) {
+  e.preventDefault();
+  const file = document.getElementById('file').files[0];
+  if (!file) return;
+  btn.disabled = true;
+  btn.textContent = 'Actualizando... no apagues la placa';
+  msg.className = ''; msg.textContent = 'Subiendo ' + (file.size/1024).toFixed(0) + ' KB...';
+  pbWrap.style.display = 'block';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update');
+  xhr.upload.onprogress = function(ev) {
+    if (ev.lengthComputable) {
+      const pct = Math.round(ev.loaded / ev.total * 100);
+      pf.style.width = pct + '%';
+      msg.textContent = 'Subiendo... ' + pct + '%';
+    }
+  };
+  xhr.onload = function() {
+    if (xhr.status === 200 && xhr.responseText.indexOf('OK') >= 0) {
+      pf.style.width = '100%';
+      msg.className = 'ok';
+      msg.textContent = '✅ Actualización correcta. Reiniciando en 5 s...';
+      setTimeout(() => { location.replace('/'); }, 8000);
+    } else {
+      msg.className = 'err';
+      msg.textContent = '❌ Error: ' + xhr.responseText;
+      btn.disabled = false;
+      btn.textContent = '⬆ Subir y actualizar';
+    }
+  };
+  xhr.onerror = function() {
+    msg.className = 'ok';
+    // Connection lost = board restarted = update probably OK
+    msg.textContent = '✅ Placa reiniciando... espera 8 s.';
+    setTimeout(() => { location.replace('/'); }, 8000);
+  };
+  const fd = new FormData();
+  fd.append('firmware', file);
+  xhr.send(fd);
+};
+</script>
+</body>
+</html>
+)rawliteral");
+    });
+
+    webServer.on("/update", HTTP_POST,
+        // Response handler — called after upload completes
+        [](AsyncWebServerRequest* req) {
+            bool ok = !Update.hasError();
+            req->send(200, "text/plain", ok ? "OK" : Update.errorString());
+            if (ok) otaRestartPending = true;
+        },
+        // Upload handler — called for each chunk of the incoming file
+        [](AsyncWebServerRequest* req, String filename,
+           size_t index, uint8_t* data, size_t len, bool final) {
+            if (!index) {
+                Serial.printf("OTA: start – %s (%u bytes)\n",
+                              filename.c_str(), req->contentLength());
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                    Serial.print("OTA begin error: ");
+                    Update.printError(Serial);
+                }
+            }
+            if (Update.isRunning()) {
+                if (Update.write(data, len) != len) {
+                    Serial.print("OTA write error: ");
+                    Update.printError(Serial);
+                }
+            }
+            if (final) {
+                if (Update.end(true)) {
+                    Serial.printf("OTA: done – %u bytes\n", index + len);
+                } else {
+                    Serial.print("OTA end error: ");
+                    Update.printError(Serial);
+                }
+            }
+        }
+    );
+
     webServer.begin();
     Serial.println("Web server started");
 }
@@ -1877,6 +2023,13 @@ void setup() {
     // Init custom 74HC595-based stepper driver (DLC32 v2.1)
     motors.begin();
 
+    // Init BLE BEFORE WiFi connects: ESP32 shares the radio between WiFi and BLE.
+    // Initialising NimBLE after WiFi is already connected can trigger a panic
+    // (radio contention during coexistence negotiation).  Starting it first lets
+    // the IDF coexistence layer set up cleanly before WiFi takes the channel.
+    NimBLEDevice::init("");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
     WiFiManager wm;
     wm.setConfigPortalTimeout(180); wm.setConnectTimeout(30); wm.setHostname("peristaltica");
     if (!wm.autoConnect("Peristaltica-Setup")) {
@@ -1898,9 +2051,6 @@ void setup() {
 
     setupNTP();
 
-    NimBLEDevice::init("");
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
     ArduinoOTA.setHostname("peristaltica");
     ArduinoOTA.begin();
     setupWebServer();
@@ -1917,6 +2067,7 @@ void setup() {
 // =========================================================
 void loop() {
     esp_task_wdt_reset();
+    if (otaRestartPending) { delay(300); ESP.restart(); }
     publishPendingMqttEvents();
     checkProgress();
     rolloverDailyTotals();
