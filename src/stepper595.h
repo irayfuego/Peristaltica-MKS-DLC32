@@ -70,6 +70,16 @@ public:
     inline void enableMotors();
     inline void disableMotors();
 
+    // ---- Diagnostics ----
+    // Pulse a single 74HC595 bit (Q1..Q7) at `hz` for `durationMs` ms,
+    // with drivers enabled (Q0 LOW).  Used to map byte-bit → physical
+    // driver socket.  Blocks the caller; do not run while a normal
+    // motor task is in flight.
+    inline void diagPulse(uint8_t bit, uint32_t hz, uint32_t durationMs);
+    // Set a fixed bit (Q1..Q7) HIGH or LOW immediately.  Used to lock
+    // a DIR line before pulsing the corresponding STEP line.
+    inline void diagSetBit(uint8_t bit, bool high);
+
 private:
     // ---- 74HC595 bit map (Qn → bit position in transmitted byte) ----
     static constexpr uint8_t BIT_DISABLE = 0;          // Q0 active HIGH
@@ -144,9 +154,12 @@ private:
     inline void stepHigh(int ch)   { writePort(uint8_t(1 << stepBitFor(ch)), 0); }
     inline void stepLow (int ch)   { writePort(0, uint8_t(1 << stepBitFor(ch))); }
     inline void setDir  (int ch, bool cw) {
+        // TMC2209 on the MKS DLC32 v2.1 reads DIR=LOW as CW, DIR=HIGH as CCW.
+        // (Empirically verified — earlier code had this inverted, motors spun
+        // backwards from the UI's CW button.)
         uint8_t m = 1 << dirBitFor(ch);
-        if (cw) writePort(m, 0);
-        else    writePort(0, m);
+        if (cw) writePort(0, m);   // CW  → DIR LOW
+        else    writePort(m, 0);   // CCW → DIR HIGH
     }
 
     static void taskTrampoline(void* arg) {
@@ -211,12 +224,15 @@ inline void Stepper595::begin() {
 
     _spiMutex = xSemaphoreCreateMutex();
 
-    // HSPI on remapped pins; MISO unused (-1).
+    // HSPI on remapped pins; MISO unused (-1), and SS=-1 too: passing GPIO17
+    // as SS makes SPIClass call spiAttachSS() which enables HW CS — the SPI
+    // peripheral then auto-toggles GPIO17 around every transfer in addition
+    // to our manual digitalWrite, producing extra LATCH rising edges that
+    // can capture half-shifted state into the 74HC595 outputs (this manifested
+    // as Q5 toggling also triggering apparent activity on Q3 / Y → Z phantom
+    // stepping).  Keep LATCH purely manual.
     _spi = new SPIClass(HSPI);
-    _spi->begin(PIN_SCK, -1, PIN_MOSI, PIN_LATCH);
-    // The Arduino SPIClass holds onto SS/CS itself; we still drive LATCH
-    // manually via digitalWrite so we get the precise rising edge after each
-    // transfer.
+    _spi->begin(PIN_SCK, -1, PIN_MOSI, -1);
 
     _bits   = 0;
     _enable = false;
@@ -267,3 +283,35 @@ inline void Stepper595::stopAll() {
 
 inline void Stepper595::enableMotors()  { _enable = true;  pushState(); }
 inline void Stepper595::disableMotors() { _enable = false; pushState(); }
+
+inline void Stepper595::diagPulse(uint8_t bit, uint32_t hz, uint32_t durationMs) {
+    if (bit < 1 || bit > 7) return;
+    if (hz == 0) hz = 100;
+    if (hz > 2000) hz = 2000;
+    if (durationMs > 5000) durationMs = 5000;
+
+    bool prevEnable = _enable;
+    _enable = true; pushState();
+    delayMicroseconds(50);
+
+    uint32_t halfUs = 500000UL / hz;
+    if (halfUs < 5) halfUs = 5;
+    uint8_t mask = (uint8_t)(1 << bit);
+
+    uint32_t end = millis() + durationMs;
+    while ((int32_t)(end - millis()) > 0) {
+        writePort(mask, 0);
+        delayMicroseconds(halfUs);
+        writePort(0, mask);
+        delayMicroseconds(halfUs);
+    }
+
+    _enable = prevEnable; pushState();
+}
+
+inline void Stepper595::diagSetBit(uint8_t bit, bool high) {
+    if (bit < 1 || bit > 7) return;
+    uint8_t m = (uint8_t)(1 << bit);
+    if (high) writePort(m, 0);
+    else      writePort(0, m);
+}

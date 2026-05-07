@@ -2109,6 +2109,23 @@ void setupWebServer() {
             saveVacationMode();
             req->send(200, "application/json", "{\"ok\":true}");
         }
+        else if (path == "/api/diag/pulse") {
+            int bit = doc["bit"] | -1;
+            int hz  = doc["hz"]  | 100;
+            int ms  = doc["ms"]  | 1500;
+            if (bit < 1 || bit > 7)        { req->send(400, "application/json", "{\"ok\":false,\"error\":\"bit\"}"); return; }
+            if (motors.anyRunning())       { req->send(409, "application/json", "{\"ok\":false,\"error\":\"running\"}"); return; }
+            req->send(200, "application/json", "{\"ok\":true}");
+            motors.diagPulse((uint8_t)bit, (uint32_t)hz, (uint32_t)ms);
+        }
+        else if (path == "/api/diag/set") {
+            int bit  = doc["bit"]  | -1;
+            bool hi  = doc["high"] | false;
+            if (bit < 1 || bit > 7)        { req->send(400, "application/json", "{\"ok\":false,\"error\":\"bit\"}"); return; }
+            if (motors.anyRunning())       { req->send(409, "application/json", "{\"ok\":false,\"error\":\"running\"}"); return; }
+            motors.diagSetBit((uint8_t)bit, hi);
+            req->send(200, "application/json", "{\"ok\":true}");
+        }
         else if (path == "/api/resetwifi") {
             req->send(200, "application/json", "{\"ok\":true}");
             delay(500);
@@ -2122,7 +2139,7 @@ void setupWebServer() {
         "/api/run", "/api/stop", "/api/calibrate", "/api/calibrate/run", "/api/calibrate/compute",
         "/api/cap", "/api/config", "/api/schedules", "/api/sensors", "/api/sensors/read",
         "/api/ble/scan", "/api/timezone", "/api/ntp", "/api/quiet", "/api/resetwifi",
-        "/api/vacation"
+        "/api/vacation", "/api/diag/pulse", "/api/diag/set"
     };
     for (auto p : posts) {
         webServer.on(p, HTTP_POST, [](AsyncWebServerRequest*){}, NULL, bodyHandler);
