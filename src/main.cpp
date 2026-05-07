@@ -736,6 +736,8 @@ input:focus,select:focus{outline:none;border-color:#1565c0;background:#fff}
 button{flex:1;padding:9px 6px;border:none;border-radius:6px;font-size:.88rem;cursor:pointer;font-weight:500;transition:opacity .15s,transform .1s}
 button:active{opacity:.75;transform:scale(.97)}
 .run{background:#1565c0;color:#fff}.stp{background:#e53935;color:#fff}
+button:disabled{opacity:.4;cursor:not-allowed}
+button:disabled:active{transform:none;opacity:.4}
 .sav{background:#2e7d32;color:#fff}.rst{background:#bf360c;color:#fff}
 .sec{background:#546e7a;color:#fff}
 .pw{margin-top:12px}
@@ -807,7 +809,7 @@ td{padding:5px 4px;border-bottom:1px solid #f5f5f5;vertical-align:middle}
 
   <div class="card full" style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
     <h2 style="border:none;padding:0;margin:0;flex:none">Control global</h2>
-    <button class="stp" style="max-width:200px;flex:unset;padding:10px 24px" onclick="stp(0)">&#9632; Parar todo</button>
+    <button class="stp" id="psAll" style="max-width:200px;flex:unset;padding:10px 24px" onclick="stp(0)" disabled>&#9632; Parar todo</button>
   </div>
 
   <div class="card full">
@@ -1101,7 +1103,7 @@ function renderChannels() {
       <select id="d${ch}"><option value="cw">CW &#8635;</option><option value="ccw">CCW &#8634;</option></select>
       <div class="row">
         <button class="run" onclick="run(${ch})">&#9654; Iniciar</button>
-        <button class="stp" onclick="stp(${ch})">&#9632; Parar</button>
+        <button class="stp" id="ps${ch}" onclick="stp(${ch})" disabled>&#9632; Parar</button>
       </div>
       <div class="pw"><div class="pl"><span>Progreso</span><span id="p${ch}t">0%</span></div>
       <div class="pb"><div class="pf" id="p${ch}" style="width:0%"></div></div></div>
@@ -1366,13 +1368,17 @@ function poll() {
     $('dM').className='dot '+(d.mqtt?'on':'off');
     const vb=$('vacBadge'); if(vb) vb.style.display=d.vacation?'':'none';
     const vcb=$('vacMode'); if(vcb&&vcb!==document.activeElement) vcb.checked=!!d.vacation;
+    let anyR=false;
     for(let i=0;i<3;i++){
       const m=d.motors[i]||{};
+      const run=!!m.running; if(run) anyR=true;
       $('p'+(i+1)).style.width=(m.progress||0)+'%';
       $('p'+(i+1)+'t').textContent=(m.progress||0)+'%';
       const cap = d.caps && d.caps[i]>0 ? ` / ${d.caps[i]} mL` : '';
       $('da'+(i+1)).textContent = `Hoy: ${(d.daily?.[i]||0).toFixed(1)} mL${cap}`;
+      const sb=$('ps'+(i+1)); if(sb) sb.disabled=!run;
     }
+    const sa=$('psAll'); if(sa) sa.disabled=!anyR;
     if(d.time)$('clock').textContent=d.time;
   });
 }

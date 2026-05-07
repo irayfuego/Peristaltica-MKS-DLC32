@@ -114,6 +114,18 @@ private:
     // Atomic: take mutex → modify shift-register state → SPI write → release.
     // setMask = bits to OR-in, clearMask = bits to AND-out (in our internal byte).
     // Q0 (DISABLE) and Q7 are *not* part of _bits; they are recomputed every push.
+    //
+    // The MKS DLC32 v2.1 wires *two* 74HC595 in daisy-chain (16 bits total):
+    //   ESP32 MOSI → 595 #1 (steppers, Q0-Q7) → QH' → 595 #2 (beeper/LED/aux)
+    // Sending only 8 bits per latch leaves chip #2's outputs holding stale data
+    // shifted out of chip #1.  Those stale bits flicker on every transfer and
+    // can phantom-drive any extra STEP/DIR lines fanned out from the aux chip,
+    // which manifests as a *second* stepper moving when you only commanded one
+    // (e.g. Y → Y+Z spinning in opposite directions).
+    //
+    // Fix: always shift 16 bits.  Upper byte = 0 (aux outputs disabled, beeper
+    // off); lower byte = our stepper bits.  MSBFIRST + transfer16 puts the
+    // lower byte at chip #1 after the latch — which is what we want.
     inline void writePort(uint8_t setMask, uint8_t clearMask) {
         if (xSemaphoreTake(_spiMutex, portMAX_DELAY) != pdTRUE) return;
         _bits = (_bits & ~clearMask) | setMask;
@@ -121,7 +133,7 @@ private:
         if (!_enable) b |= (1 << BIT_DISABLE); // Q0 HIGH ⇒ drivers disabled
         _spi->beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
         digitalWrite(PIN_LATCH, LOW);
-        _spi->transfer(b);
+        _spi->transfer16((uint16_t)b);       // 16-bit: upper=0 (aux 595), lower=b (stepper 595)
         digitalWrite(PIN_LATCH, HIGH);
         _spi->endTransaction();
         xSemaphoreGive(_spiMutex);
